@@ -50,16 +50,32 @@ class CondGANTrainer(object):
 
     def build_placeholder(self):
         '''Helper function for init_opt'''
-        self.images = tf.placeholder(
-            tf.float32, [self.batch_size] + self.dataset.image_shape,
-            name='real_images')
-        self.wrong_images = tf.placeholder(
-            tf.float32, [self.batch_size] + self.dataset.image_shape,
-            name='wrong_images'
+        # For D
+        self.tvs = tf.placeholder(
+            tf.float32, [self.batch_size] + self.dataset.tvs_shape, # [bs, 100, 20, 1]
+            name = 'real_tvs'
         )
-        self.embeddings = tf.placeholder(
-            tf.float32, [self.batch_size] + self.dataset.embedding_shape,
-            name='conditional_embeddings'
+        self.track_structures = tf.placeholder(
+            tf.float32, [self.batch_size] + self.dataset.track_structure_shape, # [bs, 20]
+            name = 'real_track_structures'
+        )
+        self.wrong_tvs = tf.placeholder(
+            tf.float32, [self.batch_size] + self.dataset.tvs_shape,
+            name = 'wrong_tvs'
+        )
+        self.wrong_track_structures = tf.placeholder(
+            tf.float32, [self.batch_size] + self.dataset.track_structure_shape,
+            name = 'wrong_track_structures'
+        )
+
+        # For G
+        self.spectrums = tf.placeholder(
+            tf.float32, [self.batch_size] + self.dataset.spectrum_shape, # [bs, 100, 100, 1]
+            name = 'spectrum_for_embeddings',
+        )
+        self.pitches = tf.placeholder(
+            tf.float32, [self.batch_size] + self.dataset.pitch_shape, # [bs, 1]
+            name = 'pitches'
         )
 
         self.generator_lr = tf.placeholder(
@@ -71,21 +87,22 @@ class CondGANTrainer(object):
             name='discriminator_learning_rate'
         )
 
-    def sample_encoded_context(self, embeddings):
+    def sample_encoded_context(self, spec_embed, pitch_embed):
         '''Helper function for init_opt'''
-        c_mean_logsigma = self.model.generate_condition(embeddings)
-        mean = c_mean_logsigma[0]
+        mean = tf.concat([spec_embed[0], pitch_embed[0]], 1)
+        logsigma = tf.concat([spec_embed[1], pitch_embed[1]], 1)
         if cfg.TRAIN.COND_AUGMENTATION:
             # epsilon = tf.random_normal(tf.shape(mean))
             epsilon = tf.truncated_normal(tf.shape(mean))
-            stddev = tf.exp(c_mean_logsigma[1])
+            stddev = tf.exp(logsigma)
             c = mean + stddev * epsilon
 
             kl_loss = KL_loss(c_mean_logsigma[0], c_mean_logsigma[1])
         else:
             c = mean
             kl_loss = 0
-
+        # spec_embedding_dim = ts.shape(c_mean_logsigma)/2
+        # return c[:, :spec_embedding_dim], c[:, spec_embedding_dim:] cfg.TRAIN.COEFF.KL * kl_loss
         return c, cfg.TRAIN.COEFF.KL * kl_loss
 
     def init_opt(self):
@@ -94,18 +111,25 @@ class CondGANTrainer(object):
         with pt.defaults_scope(phase=pt.Phase.train):
             with tf.variable_scope("g_net"):
                 # ####get output from G network################################
-                c, kl_loss = self.sample_encoded_context(self.embeddings)
+                spec_embed_c, spec_embed_logsigma = self.model.generate_spec_condition(self.spectrums)
+                pitch_embed_c, pitch_embed_logsigma = self.model.generate_pitch_condition(self.pitches)
+                c, kl_loss = self.sample_encoded_context([spec_embed_c, spec_embed_logsigma],
+                                                         [pitch_embed_c, pitch_embed_logsigma])
                 z = tf.random_normal([self.batch_size, cfg.Z_DIM])
                 self.log_vars.append(("hist_c", c))
                 self.log_vars.append(("hist_z", z))
-                fake_images = self.model.get_generator(tf.concat(1, [c, z]))
+                fake_tvs, fake_track_structures = self.model.get_generator(tf.concat(1, [c, z]))
 
             # ####get discriminator_loss and generator_loss ###################
             discriminator_loss, generator_loss =\
-                self.compute_losses(self.images,
-                                    self.wrong_images,
-                                    fake_images,
-                                    self.embeddings)
+                self.compute_losses(self.tvs,
+                                    self.track_structures,
+                                    self.wrong_tvs,
+                                    self.wrong_track_structures,
+                                    fake_tvs,
+                                    fake_track_structures,
+                                    spec_embed_c,
+                                    pitch_embed_c)
             generator_loss += kl_loss
             self.log_vars.append(("g_loss_kl_loss", kl_loss))
             self.log_vars.append(("g_loss", generator_loss))
@@ -123,17 +147,28 @@ class CondGANTrainer(object):
             print("success")
 
     def sampler(self):
-        c, _ = self.sample_encoded_context(self.embeddings)
+        spec_embed_c, spec_embed_logsigma = self.model.generate_spec_condition(self.spectrums)
+        pitch_embed_c, pitch_embed_logsigma = self.model.generate_pitch_condition(self.pitches)
+        c, _ = self.sample_encoded_context([spec_embed_c, spec_embed_logsigma],
+                                           [pitch_embed_c, pitch_embed_logsigma])
         if cfg.TRAIN.FLAG:
             z = tf.zeros([self.batch_size, cfg.Z_DIM])  # Expect similar BGs
         else:
             z = tf.random_normal([self.batch_size, cfg.Z_DIM])
         self.fake_images = self.model.get_generator(tf.concat(1, [c, z]))
 
-    def compute_losses(self, images, wrong_images, fake_images, embeddings):
-        real_logit = self.model.get_discriminator(images, embeddings)
-        wrong_logit = self.model.get_discriminator(wrong_images, embeddings)
-        fake_logit = self.model.get_discriminator(fake_images, embeddings)
+    def compute_losses(self,
+                       tvs,
+                       track_structures, 
+                       wrong_tvs, 
+                       wrong_track_structures, 
+                       fake_tvs, 
+                       fake_track_structures, 
+                       spec_embeddings, 
+                       pitches):
+        real_logit = self.model.get_discriminator(tvs, track_structures, spec_embeddings, pitches) # name_scope: d_net, in model
+        wrong_logit = self.model.get_discriminator(wrong_tvs, wrong_track_structures, spec_embeddings, pitches)
+        fake_logit = self.model.get_discriminator(fake_tvs, fake_track_structures, spec_embeddings, pitches)
 
         real_d_loss =\
             tf.nn.sigmoid_cross_entropy_with_logits(real_logit,
